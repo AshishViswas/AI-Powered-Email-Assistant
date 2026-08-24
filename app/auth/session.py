@@ -40,7 +40,21 @@ def clear_session_cookie(response: Response) -> None:
     response.delete_cookie(SESSION_COOKIE_NAME)
 
 
+def get_user_id_from_authorization_header(authorization: str | None) -> int | None:
+    if not authorization:
+        return None
+    if authorization.startswith("Bearer "):
+        token = authorization[7:].strip()
+        return get_user_id_from_token(token)
+    return None
+
+
 def get_user_id_from_request(request: Request) -> int | None:
+    auth_header = request.headers.get("Authorization")
+    user_id = get_user_id_from_authorization_header(auth_header)
+    if user_id:
+        return user_id
+
     token = request.cookies.get(SESSION_COOKIE_NAME)
     return get_user_id_from_token(token) if token else None
 

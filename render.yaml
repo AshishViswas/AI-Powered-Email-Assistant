@@ -32,6 +32,10 @@ services:
         # exact URL to the OAuth client's authorized redirect URIs in Google
         # Cloud Console.
         sync: false
+      - key: FASTAPI_BACKEND_URL
+        sync: false
+      - key: STREAMLIT_URL
+        sync: false
       - key: FERNET_SECRET_KEY
         sync: false
       - key: SESSION_SECRET

@@ -1,36 +1,15 @@
 import html
+import logging
 import re
 import textwrap
 from datetime import datetime, timezone
 import streamlit as st
 
-from app.agents.compose_agent import compose_draft, compose_reply, refine_draft
-from app.auth.session import get_user_id_from_token
+from app.api.client import ApiClientError, api_client
 from app.config import settings
-from app.db.crud import (
-    acknowledge_triage_item,
-    create_draft_email,
-    get_action_items,
-    get_all_users,
-    get_daily_briefing_data,
-    get_draft_by_id,
-    get_latest_summary,
-    get_recent_triage,
-    get_sync_state,
-    get_user_by_id,
-    get_user_contacts,
-    set_action_item_status,
-    set_draft_status,
-)
-from app.db.session import get_session, init_db
-from app.gmail.client import get_message, send_email
-import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Ensure database tables exist on fresh deploys
-init_db()
 
 # ---------------------------------------------------------------------------
 # Streamlit Page Setup & Responsive Widescreen Custom CSS
@@ -57,7 +36,6 @@ CUSTOM_CSS = """
     --text-muted: #64748B;
 }
 
-/* Ensure Top Navigation Bar is 100% Uncovered & Widescreen Responsive */
 .block-container {
     padding-top: 4.5rem !important;
     padding-bottom: 3rem !important;
@@ -72,7 +50,6 @@ html, body, [data-testid="stAppViewContainer"] {
     color: var(--text-dark);
 }
 
-/* Make Streamlit Tabs Large, Readable & Properly Spaced */
 button[data-baseweb="tab"] {
     font-size: 16px !important;
     font-weight: 700 !important;
@@ -80,7 +57,6 @@ button[data-baseweb="tab"] {
     border-radius: 8px 8px 0 0 !important;
 }
 
-/* High-DPI Responsive Metric Cards */
 .metric-box {
     background: linear-gradient(135deg, #FFFFFF 0%, #F0F9FF 100%);
     border: 1.5px solid var(--sky-border);
@@ -108,7 +84,6 @@ button[data-baseweb="tab"] {
     margin-top: 6px;
 }
 
-/* Priority & Category Badges */
 .badge {
     display: inline-block;
     padding: 4px 10px;
@@ -126,7 +101,6 @@ button[data-baseweb="tab"] {
 .badge-low { background: #F1F5F9; color: #94A3B8; border: 1px solid #E2E8F0; }
 .badge-cat { background: #E0F2FE; color: #0369A1; border: 1px solid #BAE6FD; }
 
-/* Sidebar styling */
 [data-testid="stSidebar"] {
     background-color: #0F172A !important;
 }
@@ -134,7 +108,6 @@ button[data-baseweb="tab"] {
     color: #F8FAFC !important;
 }
 
-/* Landing Page Card */
 .landing-card {
     max-width: 480px;
     margin: 40px auto;
@@ -187,36 +160,54 @@ st.html(CUSTOM_CSS)
 # ---------------------------------------------------------------------------
 # Helper Functions & User Authentication
 # ---------------------------------------------------------------------------
-def get_current_user_id() -> int | None:
+def _get_login_url() -> str:
+    return f"{settings.fastapi_backend_url.rstrip('/')}/auth/login"
+
+
+def get_authenticated_user_and_token() -> tuple[dict | None, str | None]:
     if st.query_params.get("logout"):
-        st.session_state.pop("user_id", None)
-        return None
+        st.session_state.clear()
+        st.query_params.clear()
+        return None, None
 
     session_token = st.query_params.get("session")
     if session_token:
-        user_id = get_user_id_from_token(session_token)
-        if user_id:
-            st.session_state["user_id"] = user_id
-            return user_id
+        st.session_state["session_token"] = session_token
+        # Consume parameter from URL
+        st.query_params.pop("session", None)
 
-    user_id = st.session_state.get("user_id")
-    if not user_id:
-        db = get_session()
-        from app.db.models import User
-        user = db.query(User).first()
-        db.close()
-        if user:
-            st.session_state["user_id"] = user.id
-            return user.id
+    token = st.session_state.get("session_token")
+    if not token:
+        return None, None
 
-    return user_id
+    try:
+        user = api_client.get_me(token)
+        return user, token
+    except ApiClientError as err:
+        if err.status_code == 401:
+            st.session_state.clear()
+            st.error("Session expired; please sign in again.")
+        else:
+            st.error(f"Backend API error: {err.detail}")
+        return None, None
+    except Exception as exc:
+        st.error(f"Unable to connect to backend service: {exc}")
+        return None, None
 
 
-def format_deadline_badge(deadline) -> str:
-    if not deadline:
+def format_deadline_badge(deadline_input) -> str:
+    if not deadline_input:
         return ""
+    try:
+        if isinstance(deadline_input, str):
+            dl = datetime.fromisoformat(deadline_input)
+        else:
+            dl = deadline_input
+    except Exception:
+        return ""
+
     now = datetime.now(timezone.utc)
-    dl = deadline if deadline.tzinfo else deadline.replace(tzinfo=timezone.utc)
+    dl = dl if dl.tzinfo else dl.replace(tzinfo=timezone.utc)
     seconds_left = (dl - now).total_seconds()
     label = dl.strftime("%b %d")
     if seconds_left < 0:
@@ -238,7 +229,6 @@ def parse_summary_points(summary_text: str) -> list[str]:
     seen = set()
     for raw in lines:
         cleaned = html.unescape(raw)
-        # Normalize duplicate LinkedIn invite references
         cleaned = re.sub(
             r"\btwo LinkedIn connection requests\b", "the LinkedIn connection request", cleaned, flags=re.IGNORECASE
         )
@@ -253,159 +243,10 @@ def parse_summary_points(summary_text: str) -> list[str]:
     return unique_bullets
 
 
-import socket
-import threading
-
-
-def _is_port_open(host: str, port: int) -> bool:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1.0)
-            return s.connect_ex((host, port)) == 0
-    except Exception:
-        return False
-
-
-def _ensure_backend_running():
-    backend_url = settings.fastapi_backend_url
-    if "localhost" in backend_url or "127.0.0.1" in backend_url:
-        if not _is_port_open("127.0.0.1", 7860):
-            def run_uvicorn():
-                import uvicorn
-                from app.main import app as fastapi_app
-                uvicorn.run(fastapi_app, host="0.0.0.0", port=7860, log_level="warning")
-            t = threading.Thread(target=run_uvicorn, daemon=True)
-            t.start()
-
-
-_ensure_backend_running()
-
-# ---------------------------------------------------------------------------
-# Direct OAuth Callback & Handling for Streamlit Cloud Deployment
-# ---------------------------------------------------------------------------
-def _get_effective_redirect_uri() -> str:
-    uri = (settings.GOOGLE_REDIRECT_URI or "").strip()
-    if not uri or "localhost:7860" in uri:
-        return "https://ai-gmail-assistant.streamlit.app/auth/callback"
-    return uri.rstrip("/")
-
-
-if "code" in st.query_params:
-    st.write("✅ OAuth callback reached")
-    logger.info("OAuth callback reached")
-    code = st.query_params["code"]
-    try:
-        st.write("✅ Got authorization code")
-        from google.auth.transport.requests import Request as GoogleAuthRequest
-        from google.oauth2 import id_token
-        from google_auth_oauthlib.flow import Flow
-        from app.auth.google_oauth import SCOPES, encrypt_refresh_token
-        from app.auth.session import create_session_token
-        from app.db.crud import upsert_user
-
-        redirect_uri = _get_effective_redirect_uri()
-        client_config = {
-            "web": {
-                "client_id": settings.GOOGLE_CLIENT_ID,
-                "client_secret": settings.GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-            }
-        }
-        try:
-            flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=redirect_uri)
-            flow.fetch_token(code=code)
-            st.write("✅ Token exchange successful")
-        except Exception:
-            flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=redirect_uri + "/")
-            flow.fetch_token(code=code)
-            st.write("✅ Token exchange successful for path with '/' ")
-
-        logger.info("Redirect URI: %s", redirect_uri)
-
-        credentials = flow.credentials
-
-        st.write("✅ Credentials obtained")
-        st.write("Has ID token:", credentials.id_token is not None)
-        st.write("Has refresh token:", credentials.refresh_token is not None)
-
-        logger.info("Credentials obtained")
-        logger.info("Refresh token: %s", credentials.refresh_token is not None)
-        logger.info("ID token: %s", credentials.id_token is not None)
-
-        logger.info("Token exchange successful")
-        
-
-        claims = id_token.verify_oauth2_token(
-            credentials.id_token, GoogleAuthRequest(), settings.GOOGLE_CLIENT_ID
-        )
-
-        st.write("✅ ID token verified")
-        logger.info("ID token verified")
-        st.write("Email:", claims.get("email"))
-        logger.info("Email: %s", claims.get("email"))
-
-        db = get_session()
-        user = upsert_user(
-            db,
-            google_sub=claims["sub"],
-            email=claims["email"],
-            name=claims.get("name"),
-            encrypted_refresh_token=encrypt_refresh_token(credentials.refresh_token),
-        )
-        st.write("✅ User saved:", user.id)
-        logger.info("User ID: %s", user.id)
-        db.close()
-
-        st.query_params.clear()
-        st.session_state["user_id"] = user.id
-        session_token = create_session_token(user.id)
-        st.query_params["session"] = session_token
-        st.write("✅ Session created; rerunning...")
-        logger.info("Session created")
-        st.rerun()
-    except Exception as exc:
-        st.query_params.clear()
-        logger.info("Exception: %s", exc)
-        db = get_session()
-        from app.db.models import User
-        existing_user = db.query(User).first()
-        db.close()
-        if existing_user:
-            st.session_state["user_id"] = existing_user.id
-            session_token = create_session_token(existing_user.id)
-            st.query_params["session"] = session_token
-            logger.info("User ID: %s", existing_user.id)
-            st.rerun()
-        else:
-            logger.error("No existing user found")
-            st.error(f"Google Sign-In failed: {exc}")
-
-
-def _get_login_url() -> str:
-    redirect_uri = _get_effective_redirect_uri()
-    try:
-        from google_auth_oauthlib.flow import Flow
-        from app.auth.google_oauth import SCOPES
-        client_config = {
-            "web": {
-                "client_id": settings.GOOGLE_CLIENT_ID,
-                "client_secret": settings.GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-            }
-        }
-        flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=redirect_uri)
-        auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent", include_granted_scopes="true")
-        return auth_url
-    except Exception:
-        return f"{settings.fastapi_backend_url}/auth/login"
-
-
 # ---------------------------------------------------------------------------
 # App Main Execution & Authentication Router
 # ---------------------------------------------------------------------------
-current_user_id = get_current_user_id()
+active_user, session_token = get_authenticated_user_and_token()
 
 # Sidebar Navigation
 with st.sidebar:
@@ -420,19 +261,12 @@ with st.sidebar:
         """
     )
 
-    db = get_session()
-    all_users = get_all_users(db)
-
-    active_user = None
-    if current_user_id:
-        active_user = get_user_by_id(db, current_user_id)
-
     if active_user:
         st.html(
             f"""
             <div style="background:#1E293B; border-radius:12px; padding:12px 16px; margin-bottom:20px;">
                 <div style="font-size:11px; color:#94A3B8; text-transform:uppercase; font-weight:700;">Signed in as</div>
-                <div style="font-weight:700; font-size:14px; color:#F8FAFC; overflow:hidden; text-overflow:ellipsis;">{active_user.email}</div>
+                <div style="font-weight:700; font-size:14px; color:#F8FAFC; overflow:hidden; text-overflow:ellipsis;">{html.escape(active_user.get('email', ''))}</div>
             </div>
             """
         )
@@ -445,13 +279,10 @@ with st.sidebar:
     else:
         st.warning("Not signed in")
 
-    db.close()
-
-
 # ---------------------------------------------------------------------------
 # Unauthenticated Landing Page
 # ---------------------------------------------------------------------------
-if not active_user:
+if not active_user or not session_token:
     login_url = _get_login_url()
     st.html(
         """
@@ -467,14 +298,18 @@ if not active_user:
     col_l1, col_l2, col_l3 = st.columns([1, 2, 1])
     with col_l2:
         st.link_button("🔑 Sign in with Google Account", login_url, type="primary", use_container_width=True)
-        st.caption("🔒 Uses official Google OAuth 2.0 PKCE. Credentials are never stored.")
+        st.caption("🔒 Uses official Google OAuth 2.0 PKCE via FastAPI backend. Credentials are never stored.")
 else:
-    db = get_session()
+    # Fetch dashboard data via API Client
+    try:
+        briefing_data = api_client.get_briefing(session_token)
+        user_contacts = api_client.get_contacts(session_token)
+    except ApiClientError as exc:
+        st.error(f"Failed to load briefing data: {exc.detail}")
+        st.stop()
 
-    briefing_data = get_daily_briefing_data(db, active_user.id)
-    latest_summary_obj = get_latest_summary(db, active_user.id)
-    sync_state = get_sync_state(db, active_user.id)
-    user_contacts = get_user_contacts(db, active_user.id)
+    latest_summary_obj = briefing_data.get("latest_summary")
+    sync_state = briefing_data.get("sync_state")
 
     # Main Navigation Tabs
     tab_briefing, tab_inbox, tab_tasks, tab_compose, tab_settings = st.tabs(
@@ -487,25 +322,21 @@ else:
     with tab_briefing:
         col_db_head, col_db_sync = st.columns([3, 1])
         with col_db_head:
-            st.markdown(f"## 🌅 Good day, {active_user.name or active_user.email.split('@')[0]}")
+            display_name = active_user.get("name") or active_user.get("email", "").split("@")[0]
+            st.markdown(f"## 🌅 Good day, {html.escape(display_name)}")
         with col_db_sync:
             if st.button("🔄 Sync Latest Emails", key="sync_home_btn", type="primary"):
                 with st.spinner("Fetching newest emails from Gmail & triaging with AI..."):
                     try:
-                        from app.scheduler import run_sync_for_user
-                        res = run_sync_for_user(db, active_user)
-                        if res:
-                            _, _, triaged_rows = res
-                            st.toast(f"Synced {len(triaged_rows)} new emails!")
-                        else:
-                            st.toast("Inbox up to date — no new emails found.")
+                        res = api_client.trigger_sync(session_token)
+                        st.toast(res.get("message", "Sync complete!"))
                         st.rerun()
-                    except Exception as exc:
-                        st.error(f"Sync failed: {exc}")
+                    except ApiClientError as exc:
+                        st.error(f"Sync failed: {exc.detail}")
 
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            total_cnt = briefing_data.get("total_email_count", briefing_data["new_email_count"])
+            total_cnt = briefing_data.get("total_email_count", briefing_data.get("new_email_count", 0))
             st.html(
                 f"""<div class="metric-box">
                     <div class="metric-num">{total_cnt}</div>
@@ -513,7 +344,7 @@ else:
                 </div>"""
             )
         with c2:
-            urgent_cnt = briefing_data["priority_counts"].get("urgent", 0)
+            urgent_cnt = briefing_data.get("priority_counts", {}).get("urgent", 0)
             st.html(
                 f"""<div class="metric-box">
                     <div class="metric-num" style="color:#EF4444;">{urgent_cnt}</div>
@@ -529,7 +360,7 @@ else:
                 </div>"""
             )
         with c4:
-            overdue_cnt = len(briefing_data["overdue"])
+            overdue_cnt = len(briefing_data.get("overdue", []))
             st.html(
                 f"""<div class="metric-box">
                     <div class="metric-num" style="color:#DC2626;">{overdue_cnt}</div>
@@ -543,7 +374,7 @@ else:
 
         with col_left:
             st.markdown("### 📝 Executive Summary Points")
-            summary_text = latest_summary_obj.summary_text if latest_summary_obj else ""
+            summary_text = latest_summary_obj.get("summary_text") if latest_summary_obj else ""
             bullets = parse_summary_points(summary_text)
 
             if bullets:
@@ -558,33 +389,37 @@ else:
                 st.info("No executive summary points available.")
 
             st.markdown("### ⚡ Focus & Today's Deadlines")
-            todays_items = briefing_data["todays_deadlines"]
+            todays_items = briefing_data.get("todays_deadlines", [])
             if todays_items:
                 for item in todays_items:
-                    st.warning(f"📌 **{item.description}** — Source: {item.source_sender or 'Unknown'}")
+                    st.warning(f"📌 **{html.escape(item.get('description', ''))}** — Source: {html.escape(item.get('source_sender') or 'Unknown')}")
             else:
                 st.success("🎉 No pressing deadlines due today!")
 
         with col_right:
             st.markdown("### 🚨 Overdue Items")
-            if briefing_data["overdue"]:
-                for item in briefing_data["overdue"]:
+            overdue_items = briefing_data.get("overdue", [])
+            if overdue_items:
+                for item in overdue_items:
+                    dl_str = item.get("deadline")
+                    dl_formatted = dl_str[:10] if dl_str else "Past"
                     st.error(
-                        f"⚠️ **{item.description}**\n\nDeadline: {item.deadline.strftime('%b %d') if item.deadline else 'Past'}"
+                        f"⚠️ **{html.escape(item.get('description', ''))}**\n\nDeadline: {dl_formatted}"
                     )
             else:
                 st.caption("No overdue action items.")
 
             st.markdown("### 💡 Suggested Next Actions")
-            if briefing_data["suggested_actions"]:
-                for item in briefing_data["suggested_actions"]:
-                    p_label = item.priority.value if hasattr(item.priority, "value") else (item.priority or "action")
+            suggested_actions = briefing_data.get("suggested_actions", [])
+            if suggested_actions:
+                for item in suggested_actions:
+                    p_label = item.get("priority") or "action"
                     col_act_text, col_act_btn = st.columns([3.2, 1])
                     with col_act_text:
-                        st.markdown(f"• **{item.description}** (`{p_label}`)")
+                        st.markdown(f"• **{html.escape(item.get('description', ''))}** (`{p_label}`)")
                     with col_act_btn:
-                        if st.button("Done", key=f"home_done_{item.id}"):
-                            set_action_item_status(db, active_user.id, item.id, ActionItemStatus.done)
+                        if st.button("Done", key=f"home_done_{item['id']}"):
+                            api_client.update_task_status(session_token, item["id"], "done")
                             st.toast("Action item completed!")
                             st.rerun()
             else:
@@ -605,9 +440,9 @@ else:
 
             full_msg = None
             try:
-                full_msg = get_message(active_user, open_msg_id)
-            except Exception as e:
-                st.caption(f"(Live API note: {e})")
+                full_msg = api_client.get_inbox_message(session_token, open_msg_id)
+            except ApiClientError as e:
+                st.caption(f"(Live API note: {e.detail})")
 
             with col_view_left:
                 st.markdown("### 📖 Email Message")
@@ -619,7 +454,6 @@ else:
                     st.html(f'<div style="font-size:20px; font-weight:800; color:#0F172A; margin-bottom:4px;">{sub_str}</div>')
                     st.html(f'<div style="font-size:13px; color:#64748B; margin-bottom:12px;"><strong>From:</strong> {sender_str} · <strong>Date:</strong> {date_str}</div>')
 
-                    # If HTML body is available, display exact Gmail HTML rendering!
                     html_content = full_msg.get("html_body")
                     if html_content:
                         st.html(html_content)
@@ -656,33 +490,30 @@ else:
                 if st.button("🤖 Generate AI Reply", type="primary", use_container_width=True):
                     with st.spinner("AI drafting response..."):
                         try:
-                            draft_id = compose_reply(active_user, db, open_msg_id, reply_prompt)
-                            st.session_state["active_draft_id"] = draft_id
+                            draft = api_client.compose_reply(session_token, open_msg_id, reply_prompt)
+                            st.session_state["active_draft_id"] = draft["id"]
                             st.toast("Draft created!", icon="✏️")
-                        except Exception as exc:
-                            st.error(f"Error drafting reply: {exc}")
+                        except ApiClientError as exc:
+                            st.error(f"Error drafting reply: {exc.detail}")
 
                 active_draft_id = st.session_state.get("active_draft_id")
                 if active_draft_id:
-                    draft = get_draft_by_id(db, active_user.id, active_draft_id)
-                    if draft:
-                        st.markdown("---")
-                        st.markdown("**Preview Draft:**")
-                        st.text_area("Body", value=draft.body, height=150)
-                        if st.button("🚀 Send Email Now", type="primary", use_container_width=True):
-                            with st.spinner("Sending email..."):
-                                try:
-                                    msg_id = send_email(
-                                        active_user,
-                                        to_addr=draft.to_addr,
-                                        subject=draft.subject,
-                                        body=draft.body,
-                                    )
-                                    set_draft_status(db, active_user.id, draft.id, DraftStatus.sent)
-                                    st.session_state.pop("active_draft_id", None)
-                                    st.success(f"✅ Sent! (ID: {msg_id})")
-                                except Exception as exc:
-                                    st.error(f"Send failed: {exc}")
+                    try:
+                        draft = api_client.get_draft(session_token, active_draft_id)
+                        if draft:
+                            st.markdown("---")
+                            st.markdown("**Preview Draft:**")
+                            st.text_area("Body", value=draft.get("body", ""), height=150)
+                            if st.button("🚀 Send Email Now", type="primary", use_container_width=True):
+                                with st.spinner("Sending email..."):
+                                    try:
+                                        send_res = api_client.send_draft(session_token, draft["id"], draft.get("to_addr", ""))
+                                        st.session_state.pop("active_draft_id", None)
+                                        st.success(f"✅ Sent! (ID: {send_res.get('message_id')})")
+                                    except ApiClientError as exc:
+                                        st.error(f"Send failed: {exc.detail}")
+                    except ApiClientError:
+                        st.session_state.pop("active_draft_id", None)
 
         else:
             col_inb_title, col_inb_sync = st.columns([3, 1])
@@ -692,18 +523,11 @@ else:
                 if st.button("🔄 Sync Latest Emails", type="primary"):
                     with st.spinner("Fetching newest emails from Gmail & triaging with AI..."):
                         try:
-                            from app.scheduler import run_sync_for_user
-                            res = run_sync_for_user(db, active_user)
-                            if res:
-                                _, _, triaged_rows = res
-                                st.toast(f"Synced {len(triaged_rows)} new emails!")
-                            else:
-                                st.toast("Inbox up to date — no new emails found.")
+                            res = api_client.trigger_sync(session_token)
+                            st.toast(res.get("message", "Sync complete!"))
                             st.rerun()
-                        except Exception as exc:
-                            st.error(f"Sync failed: {exc}")
-
-            recent_triages = get_recent_triage(db, active_user.id, limit=200)
+                        except ApiClientError as exc:
+                            st.error(f"Sync failed: {exc.detail}")
 
             col_f1, col_f2 = st.columns([1, 2])
             with col_f1:
@@ -718,36 +542,30 @@ else:
                     key="inbox_search_input",
                 )
 
-            filtered_triage = recent_triages
-            if priority_filter != "All":
-                filtered_triage = [
-                    t
-                    for t in filtered_triage
-                    if (t.priority.value if hasattr(t.priority, "value") else str(t.priority)) == priority_filter
-                ]
-            if search_query.strip():
-                sq = search_query.strip().lower()
-                filtered_triage = [
-                    t
-                    for t in filtered_triage
-                    if sq in (t.subject or "").lower()
-                    or sq in (t.sender or "").lower()
-                    or sq in (t.category.value if hasattr(t.category, "value") else str(t.category or "")).lower()
-                ]
+            try:
+                filtered_triage = api_client.get_inbox(
+                    session_token,
+                    priority=priority_filter if priority_filter != "All" else None,
+                    search=search_query if search_query.strip() else None,
+                    limit=200,
+                )
+            except ApiClientError as exc:
+                st.error(f"Failed to load inbox: {exc.detail}")
+                filtered_triage = []
 
             if not filtered_triage:
                 st.info("No messages match the selected filters.")
             else:
                 for item in filtered_triage:
-                    p_val = item.priority.value if hasattr(item.priority, "value") else str(item.priority)
-                    cat_val = item.category.value if hasattr(item.category, "value") else str(item.category or "other")
-                    deadline_html = format_deadline_badge(item.deadline)
+                    p_val = item.get("priority", "informational")
+                    cat_val = item.get("category") or "other"
+                    deadline_html = format_deadline_badge(item.get("deadline"))
 
-                    escaped_subject = html.escape(item.subject or "(no subject)")
-                    escaped_sender = html.escape(item.sender or "Unknown Sender")
+                    escaped_subject = html.escape(item.get("subject") or "(no subject)")
+                    escaped_sender = html.escape(item.get("sender") or "Unknown Sender")
                     action_note = (
-                        f" · <span style='color:#0284C7; font-weight:600;'>{html.escape(item.suggested_action)}</span>"
-                        if item.suggested_action
+                        f" · <span style='color:#0284C7; font-weight:600;'>{html.escape(item.get('suggested_action'))}</span>"
+                        if item.get("suggested_action")
                         else ""
                     )
 
@@ -774,12 +592,12 @@ else:
 
                         b1, b2, _ = st.columns([1, 1.2, 2.8])
                         with b1:
-                            if st.button("📖 View Email", key=f"btn_open_{item.id}"):
-                                st.session_state["open_email_id"] = item.message_id
+                            if st.button("📖 View Email", key=f"btn_open_{item['id']}"):
+                                st.session_state["open_email_id"] = item["message_id"]
                                 st.rerun()
                         with b2:
-                            if st.button("Read", key=f"btn_ack_{item.id}"):
-                                acknowledge_triage_item(db, active_user.id, item.id)
+                            if st.button("Read", key=f"btn_ack_{item['id']}"):
+                                api_client.acknowledge_triage(session_token, item["id"])
                                 st.toast("Marked as read!")
                                 st.rerun()
 
@@ -792,22 +610,26 @@ else:
         st.markdown("## 📋 Action Items & To-Dos")
 
         include_done = st.checkbox("Show completed tasks", value=False)
-        tasks = get_action_items(db, active_user.id, include_done=include_done)
+        try:
+            tasks = api_client.get_tasks(session_token, include_done=include_done)
+        except ApiClientError as exc:
+            st.error(f"Failed to fetch tasks: {exc.detail}")
+            tasks = []
 
         if not tasks:
             st.success("✨ All clear! No open action items.")
         else:
             for task in tasks:
-                is_done = task.status == ActionItemStatus.done
+                is_done = task.get("status") == "done"
                 col_check, col_desc, col_meta = st.columns([0.3, 3.2, 1])
 
                 with col_check:
                     checked = st.checkbox(
-                        "Task complete", value=is_done, key=f"task_check_{task.id}", label_visibility="collapsed"
+                        "Task complete", value=is_done, key=f"task_check_{task['id']}", label_visibility="collapsed"
                     )
                     if checked != is_done:
-                        new_status = ActionItemStatus.done if checked else ActionItemStatus.open
-                        set_action_item_status(db, active_user.id, task.id, new_status)
+                        new_status = "done" if checked else "open"
+                        api_client.update_task_status(session_token, task["id"], new_status)
                         st.rerun()
 
                 with col_desc:
@@ -817,16 +639,18 @@ else:
                         else "font-weight: 600; color: #0F172A; font-size: 15px;"
                     )
                     st.html(
-                        f"<span style='{title_style}'>{html.escape(task.description)}</span>"
+                        f"<span style='{title_style}'>{html.escape(task.get('description', ''))}</span>"
                     )
-                    if task.source_sender or task.related_person:
-                        st.caption(f"With: {html.escape(task.related_person or task.source_sender)}")
+                    related = task.get("related_person") or task.get("source_sender")
+                    if related:
+                        st.caption(f"With: {html.escape(related)}")
 
                 with col_meta:
-                    p_val = task.priority.value if hasattr(task.priority, "value") else (task.priority or "action")
+                    p_val = task.get("priority") or "action"
                     st.html(f'<span class="badge badge-{p_val}">{p_val}</span>')
-                    if task.deadline:
-                        st.caption(f"📅 {task.deadline.strftime('%b %d')}")
+                    deadline_str = task.get("deadline")
+                    if deadline_str:
+                        st.caption(f"📅 {deadline_str[:10]}")
 
     # ===========================================================================
     # TAB 4: AI EMAIL COMPOSER
@@ -862,39 +686,42 @@ else:
             else:
                 with st.spinner("AI is generating your draft..."):
                     try:
-                        full_instructions = prompt_input
-                        if target_email.strip():
-                            full_instructions = f"Send to: {target_email}\nSubject: {email_subject_prompt}\nInstructions: {prompt_input}"
-                        elif email_subject_prompt.strip():
-                            full_instructions = f"Subject: {email_subject_prompt}\nInstructions: {prompt_input}"
-
-                        draft_id = compose_draft(db, active_user.id, full_instructions)
-                        st.session_state["active_draft_id"] = draft_id
+                        draft = api_client.compose_draft(
+                            session_token,
+                            instructions=prompt_input,
+                            target_email=target_email.strip(),
+                            subject=email_subject_prompt.strip(),
+                        )
+                        st.session_state["active_draft_id"] = draft["id"]
                         st.toast("Draft created!")
                         st.rerun()
-                    except Exception as e:
-                        st.error(f"Error composing draft: {e}")
+                    except ApiClientError as e:
+                        st.error(f"Error composing draft: {e.detail}")
 
         active_draft_id = st.session_state.get("active_draft_id")
         if active_draft_id:
-            draft = get_draft_by_id(db, active_user.id, active_draft_id)
+            try:
+                draft = api_client.get_draft(session_token, active_draft_id)
+            except ApiClientError:
+                draft = None
+
             if draft:
                 st.markdown("---")
                 st.markdown("#### 🔍 Draft Preview & Review")
 
                 edit_to_addr = st.text_input(
                     "Recipient Email (To)",
-                    value=draft.to_addr or "",
+                    value=draft.get("to_addr") or "",
                     placeholder="Specify recipient email address to send (e.g. user@example.com)",
-                    key=f"edit_to_{draft.id}",
+                    key=f"edit_to_{draft['id']}",
                 )
 
                 with st.container():
                     st.html(
                         f"""
                         <div style="background:#FFFFFF; border:1.5px solid #BAE6FD; border-radius:14px; padding:20px; margin-bottom:16px;">
-                            <div style="font-size:15px; font-weight:700; color:#0F172A; margin-bottom:12px;"><strong>Subject:</strong> {html.escape(draft.subject)}</div>
-                            <div style="background:#F8FAFC; border-radius:8px; padding:14px; font-family:'Inter', sans-serif; white-space:pre-wrap; font-size:14px; color:#1E293B;">{html.escape(draft.body)}</div>
+                            <div style="font-size:15px; font-weight:700; color:#0F172A; margin-bottom:12px;"><strong>Subject:</strong> {html.escape(draft.get('subject', ''))}</div>
+                            <div style="background:#F8FAFC; border-radius:8px; padding:14px; font-family:'Inter', sans-serif; white-space:pre-wrap; font-size:14px; color:#1E293B;">{html.escape(draft.get('body', ''))}</div>
                         </div>
                         """
                     )
@@ -909,8 +736,11 @@ else:
                     if st.button("✨ Refine Draft"):
                         if refine_feedback.strip():
                             with st.spinner("Refining draft..."):
-                                refine_draft(db, active_user.id, draft.id, refine_feedback)
-                                st.rerun()
+                                try:
+                                    api_client.refine_draft(session_token, draft["id"], refine_feedback)
+                                    st.rerun()
+                                except ApiClientError as exc:
+                                    st.error(f"Refinement error: {exc.detail}")
 
                 col_send, col_discard = st.columns(2)
                 with col_send:
@@ -921,25 +751,22 @@ else:
                         else:
                             with st.spinner("Sending email via Gmail API..."):
                                 try:
-                                    msg_id = send_email(
-                                        active_user,
-                                        to_addr=final_to,
-                                        subject=draft.subject,
-                                        body=draft.body,
-                                    )
-                                    set_draft_status(db, active_user.id, draft.id, DraftStatus.sent)
+                                    send_res = api_client.send_draft(session_token, draft["id"], final_to)
                                     st.session_state.pop("active_draft_id", None)
-                                    st.success(f"Email sent successfully! (ID: {msg_id})")
+                                    st.success(f"Email sent successfully! (ID: {send_res.get('message_id')})")
                                     st.rerun()
-                                except Exception as exc:
-                                    st.error(f"Failed to send email: {exc}")
+                                except ApiClientError as exc:
+                                    st.error(f"Failed to send email: {exc.detail}")
 
                 with col_discard:
                     if st.button("🗑️ Discard Draft", use_container_width=True):
-                        set_draft_status(db, active_user.id, draft.id, DraftStatus.discarded)
-                        st.session_state.pop("active_draft_id", None)
-                        st.info("Draft discarded.")
-                        st.rerun()
+                        try:
+                            api_client.discard_draft(session_token, draft["id"])
+                            st.session_state.pop("active_draft_id", None)
+                            st.info("Draft discarded.")
+                            st.rerun()
+                        except ApiClientError as exc:
+                            st.error(f"Discard failed: {exc.detail}")
 
     # ===========================================================================
     # TAB 5: SETTINGS & SYSTEM STATUS
@@ -951,20 +778,22 @@ else:
 
         with sc1:
             st.html(
-                """
+                f"""
                 <div style="background:#FFFFFF; border:1.5px solid #BAE6FD; border-radius:14px; padding:20px; margin-bottom:16px;">
                     <div style="font-weight:700; font-size:16px; color:#0F172A; margin-bottom:12px;">🟢 System Status</div>
                     <div style="font-size:14px; color:#475569; margin-bottom:8px;">• <strong>System Status:</strong> Active & Healthy</div>
-                    <div style="font-size:14px; color:#475569; margin-bottom:8px;">• <strong>Background Sync Engine:</strong> Active (Polling every 10 min)</div>
-                    <div style="font-size:14px; color:#475569;">• <strong>AI Engine:</strong> GPT-5 Nano Email Summarizer</div>
+                    <div style="font-size:14px; color:#475569; margin-bottom:8px;">• <strong>FastAPI Backend:</strong> {html.escape(settings.fastapi_backend_url)}</div>
+                    <div style="font-size:14px; color:#475569; margin-bottom:8px;">• <strong>Background Sync Engine:</strong> Active</div>
+                    <div style="font-size:14px; color:#475569;">• <strong>AI Engine:</strong> OpenAI Email Summarizer & Triage</div>
                 </div>
                 """
             )
 
         with sc2:
+            last_sync_time = sync_state.get("last_synced_at") if sync_state else None
             last_sync_str = (
-                sync_state.last_synced_at.strftime("%Y-%m-%d %H:%M:%S UTC")
-                if sync_state and sync_state.last_synced_at
+                str(last_sync_time)[:19] + " UTC"
+                if last_sync_time
                 else "No prior sync recorded"
             )
 
@@ -972,11 +801,9 @@ else:
                 f"""
                 <div style="background:#FFFFFF; border:1.5px solid #BAE6FD; border-radius:14px; padding:20px; margin-bottom:16px;">
                     <div style="font-weight:700; font-size:16px; color:#0F172A; margin-bottom:12px;">🔐 Google OAuth Status</div>
-                    <div style="font-size:14px; color:#475569; margin-bottom:8px;">• <strong>Google OAuth 2.0:</strong> Connected</div>
-                    <div style="font-size:14px; color:#475569; margin-bottom:8px;">• <strong>Authorized User:</strong> {active_user.email}</div>
+                    <div style="font-size:14px; color:#475569; margin-bottom:8px;">• <strong>Google OAuth 2.0:</strong> Connected via FastAPI</div>
+                    <div style="font-size:14px; color:#475569; margin-bottom:8px;">• <strong>Authorized User:</strong> {html.escape(active_user.get('email', ''))}</div>
                     <div style="font-size:14px; color:#475569;">• <strong>Last Gmail Sync:</strong> {last_sync_str}</div>
                 </div>
                 """
             )
-
-    db.close()

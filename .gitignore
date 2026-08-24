@@ -36,3 +36,4 @@ MIGRATION_AND_STREAMLIT_ARCHITECTURE.md
 .pytest_cache/
 .coverage
 htmlcov/
+*.zip

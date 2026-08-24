@@ -32,8 +32,13 @@ def _add_missing_nullable_columns() -> None:
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _add_missing_nullable_columns()
+    if settings.DATABASE_URL.startswith("sqlite"):
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("PRAGMA journal_mode=WAL;"))
+        except Exception:
+            pass
 
 
 def get_session() -> Session:
-    init_db()
     return SessionLocal()

@@ -12,9 +12,10 @@ Gmail Agent is an intelligent executive email assistant built with **FastAPI**, 
 - **📖 Rich HTML Email Viewer:** Renders rich HTML email bodies exactly as displayed inside Gmail (tables, logos, styling) with zero whitespace waste.
 - **📋 Action Tasks & One-Click Resolution:** Task management interface for tracking urgent/overdue action items. Mark emails as **"Read"** and tasks as **"Done"** with real-time database state synchronization.
 - **✏️ Context-First AI Email Composer:** Generate email drafts from simple natural-language prompts without requiring a recipient email address upfront. Includes draft preview, refinement prompts, and pre-send recipient validation.
-- **📇 Deduplicated Clean Contact List:** Smart address harvester extracts clean, lowercase email addresses (stripping name artifacts and duplicate domain notices) for seamless draft composition.
-- **🛡️ Strict Anti-Hallucination Agent Logic:** Enhanced agent prompt boundaries prevent cross-contamination of facts or transaction details between separate emails in a batch.
-- **🔒 Persistent Sessions & OAuth Security:** Google OAuth 2.0 PKCE authentication with Fernet-encrypted token storage and persistent browser session management across page refreshes.
+- **📇 Deduplicated Clean Contact List:** Smart address harvester extracts clean, lowercase email addresses for seamless draft composition.
+- **🔒 Production Architecture (Decoupled Frontend & Backend):** 
+  - **FastAPI Backend (Render):** Owns Google OAuth 2.0 PKCE authentication, database CRUD operations (`/data/app.db` on persistent disk), background email polling, and REST API routes (`/api/*`).
+  - **Streamlit Frontend (Streamlit Cloud):** Pure presentation UI that consumes the backend API via session token authorization, ensuring database isolation and maximum deployment flexibility.
 
 ---
 
@@ -28,15 +29,15 @@ Gmail Agent is an intelligent executive email assistant built with **FastAPI**, 
                                         │
                                         ▼
 ┌───────────────────────────┐   ┌───────────────────────────┐
-│   Streamlit Dashboard     │   │   FastAPI Auth & Backend  │
-│   (Port 8501)              ├──►   (Port 7860)             │
-└─────────────┬─────────────┘   └─────────────┬─────────────┘
-              │                               │
-              ▼                               ▼
-┌───────────────────────────┐   ┌───────────────────────────┐
-│     SQLAlchemy DB         │   │   APScheduler Sync Engine │
-│     (SQLite / PostgreSQL) ◄───┤   (Background Gmail Poll) │
-└───────────────────────────┘   └───────────────────────────┘
+│   Streamlit Cloud (UI)    ├──►│  FastAPI Backend (Render) │
+│   (Pure Frontend Client)  │   │  (OAuth, REST API, DB)    │
+└───────────────────────────┘   └─────────────┬─────────────┘
+                                              │
+                                              ▼
+                                ┌───────────────────────────┐
+                                │ Render Persistent Disk    │
+                                │ (/data/app.db SQLite WAL) │
+                                └───────────────────────────┘
 ```
 
 ---
@@ -46,15 +47,17 @@ Gmail Agent is an intelligent executive email assistant built with **FastAPI**, 
 ```
 Gmail_Agent/
 ├── app/
+├── app/
 │   ├── agents/            # AI Agent logic (summarizer_agent, compose_agent)
+│   ├── api/               # FastAPI REST API schemas (`schemas.py`), routes (`routes.py`), and client (`client.py`)
 │   ├── auth/              # PKCE Google OAuth 2.0 authentication & session security
 │   ├── db/                # SQLAlchemy database models, CRUD operations, & datetime utilities
 │   ├── gmail/             # Gmail API client, message fetching, and HTML parser
 │   ├── ui/                # Modern Streamlit executive dashboard interface
 │   ├── config.py          # Pydantic configuration & environment settings
-│   ├── main.py            # FastAPI backend server
+│   ├── main.py            # FastAPI backend server & CORS configuration
 │   └── scheduler.py       # APScheduler background sync job
-├── tests/                 # Unit test suite (pytest)
+├── tests/                 # Comprehensive unit & API integration test suite (pytest)
 ├── .env.example           # Environment variable template
 ├── .gitignore             # Git exclusion rules
 ├── LICENSE                # MIT License
@@ -109,6 +112,8 @@ Gmail_Agent/
    GOOGLE_CLIENT_ID=your-google-client-id.apps.googleusercontent.com
    GOOGLE_CLIENT_SECRET=your-google-client-secret
    GOOGLE_REDIRECT_URI=http://localhost:7860/auth/callback
+   FASTAPI_BACKEND_URL=http://localhost:7860
+   STREAMLIT_URL=http://localhost:8501
    FERNET_SECRET_KEY=your-generated-fernet-key
    SESSION_SECRET=your-random-session-secret
    DATABASE_URL=sqlite:///./app.db
@@ -140,11 +145,24 @@ python run.py
 
 ## 🧪 Running Tests
 
-Run the unit test suite using `pytest`:
+Run the complete unit and API test suite using `pytest`:
 
 ```bash
 PYTHONPATH=. pytest
 ```
+
+---
+
+## 🌐 Production Deployment (Render + Streamlit Cloud)
+
+1. **Deploy Backend on Render:**
+   - Create a Web Service from this repo on Render using `render.yaml`.
+   - Set environment variables in Render Dashboard (`GOOGLE_REDIRECT_URI=https://<your-render-app>.onrender.com/auth/callback`, `DATABASE_URL=sqlite:////data/app.db`, etc.).
+   - Attach persistent disk mounted at `/data`.
+
+2. **Deploy UI on Streamlit Community Cloud:**
+   - Connect repository in Streamlit Cloud pointing to `streamlit_app.py`.
+   - Set Secrets in Streamlit Cloud: `FASTAPI_BACKEND_URL=https://<your-render-app>.onrender.com`.
 
 ---
 

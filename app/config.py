@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
     GOOGLE_REDIRECT_URI: str = "http://localhost:7860/auth/callback"
+    FASTAPI_BACKEND_URL: str = "http://localhost:7860"
     FERNET_SECRET_KEY: str = ""
     SESSION_SECRET: str = "default_secret_key"
     DATABASE_URL: str = "sqlite:///./app.db"
@@ -32,6 +33,8 @@ class Settings(BaseSettings):
 
     @property
     def fastapi_backend_url(self) -> str:
+        if self.FASTAPI_BACKEND_URL:
+            return self.FASTAPI_BACKEND_URL.rstrip("/")
         if self.GOOGLE_REDIRECT_URI and "/auth/callback" in self.GOOGLE_REDIRECT_URI:
             return self.GOOGLE_REDIRECT_URI.rsplit("/auth/callback", 1)[0]
         return "http://localhost:7860"
