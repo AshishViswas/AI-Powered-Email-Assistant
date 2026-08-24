@@ -23,6 +23,7 @@ env/
 
 # Internal Architecture Notes & Temp Files
 MIGRATION_AND_STREAMLIT_ARCHITECTURE.md
+Gmail_Agent_Production_Refactor_Plan.md
 
 # IDE & OS Files
 .claude/

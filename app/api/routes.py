@@ -41,8 +41,16 @@ from app.api.schemas import (
 router = APIRouter(prefix="/api", tags=["api"])
 
 
+@router.get("/health")
+def health_check():
+    """Lightweight backend health check that does not require authentication."""
+    return {"status": "ok", "service": "gmail-agent-api"}
+
+
+
 def get_db() -> Generator[Session, None, None]:
-    db = app.db.session.get_session()
+    """Yield a short-lived SQLAlchemy session for one API request."""
+    db = get_session()
     try:
         yield db
     finally:

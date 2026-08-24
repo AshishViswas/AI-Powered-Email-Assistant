@@ -52,6 +52,12 @@ def test_auth_login_redirect(client):
     assert "accounts.google.com" in response.headers.get("location", "")
 
 
+def test_health_endpoint(client):
+    response = client.get("/api/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "service": "gmail-agent-api"}
+
+
 def test_unauthenticated_api_access_returns_401(client):
     response = client.get("/api/me")
     assert response.status_code == 401

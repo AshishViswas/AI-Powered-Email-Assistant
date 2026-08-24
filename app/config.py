@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     FASTAPI_BACKEND_URL: str = "http://localhost:7860"
     FERNET_SECRET_KEY: str = ""
     SESSION_SECRET: str = "default_secret_key"
-    DATABASE_URL: str = "sqlite:///./app.db"
+    DATABASE_URL: str = "sqlite:///./gmail.db"
     STREAMLIT_URL: str = "http://localhost:8501"
     SYNC_INTERVAL_SECONDS: int = 600  # background Gmail poll interval
     UI_REFRESH_SECONDS: int = 20  # how often the open browser tab re-reads the DB

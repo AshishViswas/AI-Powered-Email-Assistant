@@ -1,24 +1,13 @@
 services:
   - type: web
-    name: gmail-agent
+    name: gmail-agent-api
     runtime: python
-    # IMPORTANT: pick a paid, always-on plan here (e.g. "starter" or higher) —
-    # NOT "free". Render's free tier spins the service down after periods of
-    # inactivity, which would silently kill the in-process APScheduler job
-    # that polls Gmail every SYNC_INTERVAL_SECONDS. This is a hard
-    # requirement, not a nice-to-have: on the free tier, syncs simply stop
-    # happening whenever the service is asleep, with no error surfaced
-    # anywhere.
-    plan: starter
+    # Demo/portfolio deployment. Render Free services use an ephemeral
+    # filesystem, so SQLite data may be lost when the service is recreated.
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-    disk:
-      name: gmail-agent-data
-      mountPath: /data
-      sizeGB: 1
     envVars:
-      # sync: false means "set this manually in the Render dashboard" — it
-      # keeps every secret out of this file and out of git entirely.
       - key: OPENAI_API_KEY
         sync: false
       - key: GOOGLE_CLIENT_ID
@@ -26,11 +15,6 @@ services:
       - key: GOOGLE_CLIENT_SECRET
         sync: false
       - key: GOOGLE_REDIRECT_URI
-        # Render only assigns your service's URL after the first deploy, so
-        # this can't be known in advance. Set it manually afterwards to
-        # https://<your-service>.onrender.com/auth/callback, and add that
-        # exact URL to the OAuth client's authorized redirect URIs in Google
-        # Cloud Console.
         sync: false
       - key: FASTAPI_BACKEND_URL
         sync: false
@@ -41,7 +25,7 @@ services:
       - key: SESSION_SECRET
         sync: false
       - key: DATABASE_URL
-        value: sqlite:////data/app.db
+        value: sqlite:///./gmail.db
       - key: SYNC_INTERVAL_SECONDS
         value: "600"
       - key: UI_REFRESH_SECONDS

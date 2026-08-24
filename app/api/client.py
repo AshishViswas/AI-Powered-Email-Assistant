@@ -20,7 +20,10 @@ class ApiClient:
 
     @property
     def base_url(self) -> str:
-        return (self._base_url or settings.fastapi_backend_url).rstrip("/")
+        base_url = (self._base_url or settings.fastapi_backend_url).strip().rstrip("/")
+        if not base_url:
+            raise ApiClientError(503, "FASTAPI_BACKEND_URL is not configured.")
+        return base_url
 
     def _headers(self, session_token: str) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -37,8 +40,10 @@ class ApiClient:
         json_data: Optional[Dict[str, Any]] = None,
         timeout: int = 30,
     ) -> Any:
-        url = f"{self.base_url}{path}"
+        normalized_path = "/" + path.lstrip("/")
+        url = f"{self.base_url}{normalized_path}"
         headers = self._headers(session_token)
+        logger.info("API request: %s %s", method.upper(), url)
         try:
             response = requests.request(
                 method,
@@ -48,6 +53,7 @@ class ApiClient:
                 json=json_data,
                 timeout=timeout,
             )
+            logger.info("API response: %s %s -> %s", method.upper(), url, response.status_code)
             if not response.ok:
                 detail = f"HTTP {response.status_code}"
                 try:
