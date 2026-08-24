@@ -1,0 +1,38 @@
+# Environment & Secrets
+.env
+.env.local
+.env.production
+*.env
+credentials.json
+client_secret*.json
+*.token
+*.pem
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Python & Virtual Environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+ENV/
+env/
+
+# Internal Architecture Notes & Temp Files
+MIGRATION_AND_STREAMLIT_ARCHITECTURE.md
+
+# IDE & OS Files
+.claude/
+.gemini/
+.vscode/
+.idea/
+.DS_Store
+*.log
+
+# Test & Cache
+.pytest_cache/
+.coverage
+htmlcov/
